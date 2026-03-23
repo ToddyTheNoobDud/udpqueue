@@ -1,11 +1,11 @@
 {
-  "name": "@napi-rs/package-template",
+  "name": "@toddynnn/udpqueue",
   "version": "1.0.0",
-  "description": "Template project for writing node package with napi-rs",
+  "description": "An udpqueue made to replace setTimeout in nodelink's voice code.",
   "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/napi-rs/package-template.git"
+    "url": "https://github.com/ToddyTheNoobDud/udpqueue"
   },
   "license": "MIT",
   "browser": "browser.js",
@@ -23,7 +23,7 @@
     "browser.js"
   ],
   "napi": {
-    "binaryName": "package-template",
+    "binaryName": "udpqueue",
     "targets": [
       "x86_64-pc-windows-msvc",
       "x86_64-apple-darwin",
@@ -42,7 +42,7 @@
     ]
   },
   "engines": {
-    "node": ">= 10"
+    "node": ">= 12"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
@@ -113,5 +113,5 @@
     "singleQuote": true,
     "arrowParens": "always"
   },
-  "packageManager": "yarn@4.13.0"
+  "packageManager": "pnpm@10.32.1"
 }
