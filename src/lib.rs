@@ -13,610 +13,611 @@ const DEFAULT_BUFFER_DURATION_MS: u32 = 400;
 const PREALLOCATED_QUEUES: usize = 64;
 
 fn queue_capacity_from_ms(buffer_duration_ms: u32) -> usize {
-    ((buffer_duration_ms as usize) / 20).max(1)
+  ((buffer_duration_ms as usize) / 20).max(1)
 }
 
 struct PacketSlot {
-    data: [u8; MAX_PACKET_SIZE],
-    len: usize,
+  data: [u8; MAX_PACKET_SIZE],
+  len: usize,
 }
 
 impl Default for PacketSlot {
-    fn default() -> Self {
-        Self {
-            data: [0u8; MAX_PACKET_SIZE],
-            len: 0,
-        }
+  fn default() -> Self {
+    Self {
+      data: [0u8; MAX_PACKET_SIZE],
+      len: 0,
     }
+  }
 }
 
 struct RingBuffer {
-    slots: Vec<PacketSlot>,
-    capacity: usize,
-    head: usize,
-    tail: usize,
-    count: usize,
+  slots: Vec<PacketSlot>,
+  capacity: usize,
+  head: usize,
+  tail: usize,
+  count: usize,
 }
 
 impl RingBuffer {
-    fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+  fn new(capacity: usize) -> Self {
+    let capacity = capacity.max(1);
 
-        let mut slots = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            slots.push(PacketSlot::default());
-        }
-
-        Self {
-            slots,
-            capacity,
-            head: 0,
-            tail: 0,
-            count: 0,
-        }
+    let mut slots = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+      slots.push(PacketSlot::default());
     }
 
-    fn push(&mut self, data: &[u8]) -> bool {
-        if self.count >= self.capacity || data.len() > MAX_PACKET_SIZE {
-            return false;
-        }
+    Self {
+      slots,
+      capacity,
+      head: 0,
+      tail: 0,
+      count: 0,
+    }
+  }
 
-        let slot = &mut self.slots[self.head];
-        slot.data[..data.len()].copy_from_slice(data);
-        slot.len = data.len();
-
-        self.head = (self.head + 1) % self.capacity;
-        self.count += 1;
-        true
+  fn push(&mut self, data: &[u8]) -> bool {
+    if self.count >= self.capacity || data.len() > MAX_PACKET_SIZE {
+      return false;
     }
 
-    fn pop(&mut self) -> Option<&[u8]> {
-        if self.count == 0 {
-            return None;
-        }
+    let slot = &mut self.slots[self.head];
+    slot.data[..data.len()].copy_from_slice(data);
+    slot.len = data.len();
 
-        let tail = self.tail;
-        let len = self.slots[tail].len;
+    self.head = (self.head + 1) % self.capacity;
+    self.count += 1;
+    true
+  }
 
-        self.tail = (self.tail + 1) % self.capacity;
-        self.count -= 1;
-
-        Some(&self.slots[tail].data[..len])
+  fn pop(&mut self) -> Option<&[u8]> {
+    if self.count == 0 {
+      return None;
     }
 
-    fn is_empty(&self) -> bool {
-        self.count == 0
-    }
+    let tail = self.tail;
+    let len = self.slots[tail].len;
+
+    self.tail = (self.tail + 1) % self.capacity;
+    self.count -= 1;
+
+    Some(&self.slots[tail].data[..len])
+  }
+
+  fn is_empty(&self) -> bool {
+    self.count == 0
+  }
 }
 
 struct QueueInner {
-    buffer: RingBuffer,
-    addr: SockAddr,
-    active_index: Option<usize>,
+  buffer: RingBuffer,
+  addr: SockAddr,
+  active_index: Option<usize>,
 }
 
 struct QueueManagerInner {
-    // Key = index into this Vec. Deleted queues become None.
-    queues: Vec<Option<QueueInner>>,
-    // Only queues that currently have at least 1 packet buffered.
-    active_keys: Vec<u32>,
+  // Key = index into this Vec. Deleted queues become None.
+  queues: Vec<Option<QueueInner>>,
+  // Only queues that currently have at least 1 packet buffered.
+  active_keys: Vec<u32>,
 }
 
 impl QueueManagerInner {
-    fn new() -> Self {
-        Self {
-            queues: Vec::with_capacity(PREALLOCATED_QUEUES),
-            active_keys: Vec::with_capacity(PREALLOCATED_QUEUES),
-        }
+  fn new() -> Self {
+    Self {
+      queues: Vec::with_capacity(PREALLOCATED_QUEUES),
+      active_keys: Vec::with_capacity(PREALLOCATED_QUEUES),
+    }
+  }
+
+  fn get_queue(&self, key: u32) -> Option<&QueueInner> {
+    self.queues.get(key as usize)?.as_ref()
+  }
+
+  fn get_queue_mut(&mut self, key: u32) -> Option<&mut QueueInner> {
+    self.queues.get_mut(key as usize)?.as_mut()
+  }
+
+  fn insert_queue(&mut self, queue: QueueInner) -> Result<u32> {
+    let key =
+      u32::try_from(self.queues.len()).map_err(|_| napi::Error::from_reason("Too many queues"))?;
+    self.queues.push(Some(queue));
+    Ok(key)
+  }
+
+  fn activate_queue(&mut self, key: u32) {
+    let idx = key as usize;
+
+    let already_active = match self.queues.get(idx).and_then(|q| q.as_ref()) {
+      Some(queue) => queue.active_index.is_some(),
+      None => return,
+    };
+
+    if already_active {
+      return;
     }
 
-    fn get_queue(&self, key: u32) -> Option<&QueueInner> {
-        self.queues.get(key as usize)?.as_ref()
+    let pos = self.active_keys.len();
+    self.active_keys.push(key);
+
+    if let Some(Some(queue)) = self.queues.get_mut(idx) {
+      queue.active_index = Some(pos);
+    }
+  }
+
+  fn deactivate_active_key_at(&mut self, pos: usize) {
+    if pos >= self.active_keys.len() {
+      return;
     }
 
-    fn get_queue_mut(&mut self, key: u32) -> Option<&mut QueueInner> {
-        self.queues.get_mut(key as usize)?.as_mut()
+    let removed_key = self.active_keys[pos];
+
+    if let Some(queue) = self.get_queue_mut(removed_key) {
+      queue.active_index = None;
     }
 
-    fn insert_queue(&mut self, queue: QueueInner) -> Result<u32> {
-        let key = u32::try_from(self.queues.len())
-            .map_err(|_| napi::Error::from_reason("Too many queues"))?;
-        self.queues.push(Some(queue));
-        Ok(key)
+    self.active_keys.swap_remove(pos);
+
+    if pos < self.active_keys.len() {
+      let moved_key = self.active_keys[pos];
+      if let Some(moved_queue) = self.get_queue_mut(moved_key) {
+        moved_queue.active_index = Some(pos);
+      }
+    }
+  }
+
+  fn deactivate_queue(&mut self, key: u32) {
+    let pos = match self.get_queue(key).and_then(|q| q.active_index) {
+      Some(pos) => pos,
+      None => return,
+    };
+
+    self.deactivate_active_key_at(pos);
+  }
+
+  fn remove_queue(&mut self, key: u32) -> bool {
+    let idx = key as usize;
+
+    if idx >= self.queues.len() || self.queues[idx].is_none() {
+      return false;
     }
 
-    fn activate_queue(&mut self, key: u32) {
-        let idx = key as usize;
-
-        let already_active = match self.queues.get(idx).and_then(|q| q.as_ref()) {
-            Some(queue) => queue.active_index.is_some(),
-            None => return,
-        };
-
-        if already_active {
-            return;
-        }
-
-        let pos = self.active_keys.len();
-        self.active_keys.push(key);
-
-        if let Some(Some(queue)) = self.queues.get_mut(idx) {
-            queue.active_index = Some(pos);
-        }
-    }
-
-    fn deactivate_active_key_at(&mut self, pos: usize) {
-        if pos >= self.active_keys.len() {
-            return;
-        }
-
-        let removed_key = self.active_keys[pos];
-
-        if let Some(queue) = self.get_queue_mut(removed_key) {
-            queue.active_index = None;
-        }
-
-        self.active_keys.swap_remove(pos);
-
-        if pos < self.active_keys.len() {
-            let moved_key = self.active_keys[pos];
-            if let Some(moved_queue) = self.get_queue_mut(moved_key) {
-                moved_queue.active_index = Some(pos);
-            }
-        }
-    }
-
-    fn deactivate_queue(&mut self, key: u32) {
-        let pos = match self.get_queue(key).and_then(|q| q.active_index) {
-            Some(pos) => pos,
-            None => return,
-        };
-
-        self.deactivate_active_key_at(pos);
-    }
-
-    fn remove_queue(&mut self, key: u32) -> bool {
-        let idx = key as usize;
-
-        if idx >= self.queues.len() || self.queues[idx].is_none() {
-            return false;
-        }
-
-        self.deactivate_queue(key);
-        self.queues[idx] = None;
-        true
-    }
+    self.deactivate_queue(key);
+    self.queues[idx] = None;
+    true
+  }
 }
 
 struct PendingPacket {
-    len: usize,
-    addr: SockAddr,
+  len: usize,
+  addr: SockAddr,
 }
 
 #[cfg(windows)]
 mod platform {
-    use super::*;
-    use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
-    };
+  use super::*;
+  use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+  };
 
-    pub struct TimerResolutionGuard;
+  pub struct TimerResolutionGuard;
 
-    impl TimerResolutionGuard {
-        pub fn new() -> Self {
-            unsafe {
-                let _ = timeBeginPeriod(1);
-            }
-            Self
-        }
+  impl TimerResolutionGuard {
+    pub fn new() -> Self {
+      unsafe {
+        let _ = timeBeginPeriod(1);
+      }
+      Self
+    }
+  }
+
+  impl Drop for TimerResolutionGuard {
+    fn drop(&mut self) {
+      unsafe {
+        let _ = timeEndPeriod(1);
+      }
+    }
+  }
+
+  pub struct SleepContext;
+
+  impl SleepContext {
+    pub fn new() -> Self {
+      Self
+    }
+  }
+
+  pub fn set_current_thread_priority() {
+    unsafe {
+      let thread = GetCurrentThread();
+      let _ = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
+    }
+  }
+
+  pub fn precise_sleep_until(target: Instant, _ctx: &SleepContext) {
+    if target <= Instant::now() {
+      return;
     }
 
-    impl Drop for TimerResolutionGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = timeEndPeriod(1);
-            }
-        }
+    let remaining = target.saturating_duration_since(Instant::now());
+    let coarse = remaining.saturating_sub(Duration::from_millis(2));
+
+    if !coarse.is_zero() {
+      thread::sleep(coarse);
     }
 
-    pub struct SleepContext;
-
-    impl SleepContext {
-        pub fn new() -> Self {
-            Self
-        }
+    while Instant::now() < target {
+      std::hint::spin_loop();
+      thread::yield_now();
     }
-
-    pub fn set_current_thread_priority() {
-        unsafe {
-            let thread = GetCurrentThread();
-            let _ = SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
-        }
-    }
-
-    pub fn precise_sleep_until(target: Instant, _ctx: &SleepContext) {
-        if target <= Instant::now() {
-            return;
-        }
-
-        let remaining = target.saturating_duration_since(Instant::now());
-        let coarse = remaining.saturating_sub(Duration::from_millis(2));
-
-        if !coarse.is_zero() {
-            thread::sleep(coarse);
-        }
-
-        while Instant::now() < target {
-            std::hint::spin_loop();
-            thread::yield_now();
-        }
-    }
+  }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::*;
-    use libc::{clock_gettime, clock_nanosleep, pthread_self, pthread_setschedparam};
-    use libc::{sched_param, timespec, CLOCK_MONOTONIC, EINTR, SCHED_FIFO, TIMER_ABSTIME};
+  use super::*;
+  use libc::{clock_gettime, clock_nanosleep, pthread_self, pthread_setschedparam};
+  use libc::{sched_param, timespec, CLOCK_MONOTONIC, EINTR, SCHED_FIFO, TIMER_ABSTIME};
 
-    pub struct TimerResolutionGuard;
+  pub struct TimerResolutionGuard;
 
-    impl TimerResolutionGuard {
-        pub fn new() -> Self {
-            Self
-        }
+  impl TimerResolutionGuard {
+    pub fn new() -> Self {
+      Self
+    }
+  }
+
+  pub struct SleepContext {
+    base_instant: Instant,
+    base_timespec: timespec,
+  }
+
+  impl SleepContext {
+    pub fn new() -> Self {
+      let mut ts = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+      };
+
+      unsafe {
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+      }
+
+      Self {
+        base_instant: Instant::now(),
+        base_timespec: ts,
+      }
+    }
+  }
+
+  fn add_duration(ts: timespec, dur: Duration) -> timespec {
+    let mut sec = ts.tv_sec + dur.as_secs() as libc::time_t;
+    let mut nsec = ts.tv_nsec + dur.subsec_nanos() as libc::c_long;
+
+    if nsec >= 1_000_000_000 {
+      sec += 1;
+      nsec -= 1_000_000_000;
     }
 
-    pub struct SleepContext {
-        base_instant: Instant,
-        base_timespec: timespec,
+    timespec {
+      tv_sec: sec,
+      tv_nsec: nsec,
+    }
+  }
+
+  pub fn set_current_thread_priority() {
+    unsafe {
+      let mut param: sched_param = std::mem::zeroed();
+      param.sched_priority = 10;
+      let _ = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+    }
+  }
+
+  pub fn precise_sleep_until(target: Instant, ctx: &SleepContext) {
+    if target <= Instant::now() {
+      return;
     }
 
-    impl SleepContext {
-        pub fn new() -> Self {
-            let mut ts = timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
+    let delta = target.saturating_duration_since(ctx.base_instant);
+    let abs_target = add_duration(ctx.base_timespec, delta);
 
-            unsafe {
-                clock_gettime(CLOCK_MONOTONIC, &mut ts);
-            }
+    loop {
+      let rc = unsafe {
+        clock_nanosleep(
+          CLOCK_MONOTONIC,
+          TIMER_ABSTIME,
+          &abs_target,
+          std::ptr::null_mut(),
+        )
+      };
 
-            Self {
-                base_instant: Instant::now(),
-                base_timespec: ts,
-            }
-        }
+      if rc == 0 {
+        break;
+      }
+
+      if rc != EINTR {
+        break;
+      }
     }
-
-    fn add_duration(ts: timespec, dur: Duration) -> timespec {
-        let mut sec = ts.tv_sec + dur.as_secs() as libc::time_t;
-        let mut nsec = ts.tv_nsec + dur.subsec_nanos() as libc::c_long;
-
-        if nsec >= 1_000_000_000 {
-            sec += 1;
-            nsec -= 1_000_000_000;
-        }
-
-        timespec {
-            tv_sec: sec,
-            tv_nsec: nsec,
-        }
-    }
-
-    pub fn set_current_thread_priority() {
-        unsafe {
-            let param = sched_param { sched_priority: 10 };
-            let _ = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
-        }
-    }
-
-    pub fn precise_sleep_until(target: Instant, ctx: &SleepContext) {
-        if target <= Instant::now() {
-            return;
-        }
-
-        let delta = target.saturating_duration_since(ctx.base_instant);
-        let abs_target = add_duration(ctx.base_timespec, delta);
-
-        loop {
-            let rc = unsafe {
-                clock_nanosleep(
-                    CLOCK_MONOTONIC,
-                    TIMER_ABSTIME,
-                    &abs_target,
-                    std::ptr::null_mut(),
-                )
-            };
-
-            if rc == 0 {
-                break;
-            }
-
-            if rc != EINTR {
-                break;
-            }
-        }
-    }
+  }
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 mod platform {
-    use super::*;
+  use super::*;
 
-    pub struct TimerResolutionGuard;
+  pub struct TimerResolutionGuard;
 
-    impl TimerResolutionGuard {
-        pub fn new() -> Self {
-            Self
-        }
+  impl TimerResolutionGuard {
+    pub fn new() -> Self {
+      Self
     }
+  }
 
-    pub struct SleepContext;
+  pub struct SleepContext;
 
-    impl SleepContext {
-        pub fn new() -> Self {
-            Self
-        }
+  impl SleepContext {
+    pub fn new() -> Self {
+      Self
     }
+  }
 
-    pub fn set_current_thread_priority() {
-        // no-op
-    }
+  pub fn set_current_thread_priority() {
+    // no-op
+  }
 
-    pub fn precise_sleep_until(target: Instant, _ctx: &SleepContext) {
-        let now = Instant::now();
-        if target > now {
-            thread::sleep(target - now);
-        }
+  pub fn precise_sleep_until(target: Instant, _ctx: &SleepContext) {
+    let now = Instant::now();
+    if target > now {
+      thread::sleep(target - now);
     }
+  }
 }
 
 fn sender_thread(
-    inner: Arc<Mutex<QueueManagerInner>>,
-    socket: Arc<Socket>,
-    running: Arc<AtomicBool>,
-    packets_sent: Arc<AtomicU64>,
-    packets_dropped: Arc<AtomicU64>,
+  inner: Arc<Mutex<QueueManagerInner>>,
+  socket: Arc<Socket>,
+  running: Arc<AtomicBool>,
+  packets_sent: Arc<AtomicU64>,
+  packets_dropped: Arc<AtomicU64>,
 ) {
-    let _timer_resolution = platform::TimerResolutionGuard::new();
-    let sleep_ctx = platform::SleepContext::new();
-    platform::set_current_thread_priority();
+  let _timer_resolution = platform::TimerResolutionGuard::new();
+  let sleep_ctx = platform::SleepContext::new();
+  platform::set_current_thread_priority();
 
-    let frame_duration = Duration::from_nanos(FRAME_DURATION_NS);
+  let frame_duration = Duration::from_nanos(FRAME_DURATION_NS);
 
-    let mut pending: Vec<PendingPacket> = Vec::with_capacity(PREALLOCATED_QUEUES);
-    let mut send_bufs: Vec<[u8; MAX_PACKET_SIZE]> = Vec::with_capacity(PREALLOCATED_QUEUES);
-    for _ in 0..PREALLOCATED_QUEUES {
-        send_bufs.push([0u8; MAX_PACKET_SIZE]);
-    }
+  let mut pending: Vec<PendingPacket> = Vec::with_capacity(PREALLOCATED_QUEUES);
+  let mut send_bufs: Vec<[u8; MAX_PACKET_SIZE]> = Vec::with_capacity(PREALLOCATED_QUEUES);
+  for _ in 0..PREALLOCATED_QUEUES {
+    send_bufs.push([0u8; MAX_PACKET_SIZE]);
+  }
 
-    let mut next_tick = Instant::now();
+  let mut next_tick = Instant::now();
 
-    while running.load(Ordering::Acquire) {
-        next_tick += frame_duration;
-        pending.clear();
+  while running.load(Ordering::Acquire) {
+    next_tick += frame_duration;
+    pending.clear();
 
-        // Phase 1: pop one packet from each active queue under the lock.
+    // Phase 1: pop one packet from each active queue under the lock.
+    {
+      let mut guard = inner.lock().unwrap();
+
+      let mut i = 0;
+      while i < guard.active_keys.len() {
+        let key = guard.active_keys[i];
+
+        let mut popped: Option<(usize, SockAddr)> = None;
+        let mut should_deactivate = false;
+
         {
-            let mut guard = inner.lock().unwrap();
+          let queue_opt = guard.get_queue_mut(key);
 
-            let mut i = 0;
-            while i < guard.active_keys.len() {
-                let key = guard.active_keys[i];
-
-                let mut popped: Option<(usize, SockAddr)> = None;
-                let mut should_deactivate = false;
-
-                {
-                    let queue_opt = guard.get_queue_mut(key);
-
-                    match queue_opt {
-                        Some(queue) => {
-                            if let Some(data) = queue.buffer.pop() {
-                                let buf_idx = pending.len();
-                                if buf_idx >= send_bufs.len() {
-                                    send_bufs.push([0u8; MAX_PACKET_SIZE]);
-                                }
-
-                                send_bufs[buf_idx][..data.len()].copy_from_slice(data);
-                                popped = Some((data.len(), queue.addr.clone()));
-
-                                if queue.buffer.is_empty() {
-                                    should_deactivate = true;
-                                }
-                            } else {
-                                should_deactivate = true;
-                            }
-                        }
-                        None => {
-                            should_deactivate = true;
-                        }
-                    }
+          match queue_opt {
+            Some(queue) => {
+              if let Some(data) = queue.buffer.pop() {
+                let buf_idx = pending.len();
+                if buf_idx >= send_bufs.len() {
+                  send_bufs.push([0u8; MAX_PACKET_SIZE]);
                 }
 
-                if let Some((len, addr)) = popped {
-                    pending.push(PendingPacket { len, addr });
-                }
+                send_bufs[buf_idx][..data.len()].copy_from_slice(data);
+                popped = Some((data.len(), queue.addr.clone()));
 
-                if should_deactivate {
-                    guard.deactivate_active_key_at(i);
-                } else {
-                    i += 1;
+                if queue.buffer.is_empty() {
+                  should_deactivate = true;
                 }
+              } else {
+                should_deactivate = true;
+              }
             }
+            None => {
+              should_deactivate = true;
+            }
+          }
         }
 
-        // Phase 2: send outside the lock.
-        for (i, pkt) in pending.iter().enumerate() {
-            match socket.send_to(&send_bufs[i][..pkt.len], &pkt.addr) {
-                Ok(_) => {
-                    packets_sent.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => {
-                    packets_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        if let Some((len, addr)) = popped {
+          pending.push(PendingPacket { len, addr });
         }
 
-        let now = Instant::now();
-        if next_tick > now {
-            platform::precise_sleep_until(next_tick, &sleep_ctx);
+        if should_deactivate {
+          guard.deactivate_active_key_at(i);
         } else {
-            // We fell behind; resync instead of accumulating drift.
-            next_tick = now;
+          i += 1;
         }
+      }
     }
+
+    // Phase 2: send outside the lock.
+    for (i, pkt) in pending.iter().enumerate() {
+      match socket.send_to(&send_bufs[i][..pkt.len], &pkt.addr) {
+        Ok(_) => {
+          packets_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+          packets_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+      }
+    }
+
+    let now = Instant::now();
+    if next_tick > now {
+      platform::precise_sleep_until(next_tick, &sleep_ctx);
+    } else {
+      // We fell behind; resync instead of accumulating drift.
+      next_tick = now;
+    }
+  }
 }
 
 /// Native UDP queue manager that sends packets from a dedicated thread
 /// on a fixed 20ms cadence, independent of JS event-loop jitter.
 #[napi]
 pub struct UdpQueueManager {
-    inner: Arc<Mutex<QueueManagerInner>>,
-    #[allow(dead_code)]
-    socket: Arc<Socket>,
-    running: Arc<AtomicBool>,
-    #[allow(dead_code)]
-    packets_sent: Arc<AtomicU64>,
-    packets_dropped: Arc<AtomicU64>,
-    default_buffer_duration_ms: u32,
-    thread_handle: Option<thread::JoinHandle<()>>,
+  inner: Arc<Mutex<QueueManagerInner>>,
+  #[allow(dead_code)]
+  socket: Arc<Socket>,
+  running: Arc<AtomicBool>,
+  #[allow(dead_code)]
+  packets_sent: Arc<AtomicU64>,
+  packets_dropped: Arc<AtomicU64>,
+  default_buffer_duration_ms: u32,
+  thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl UdpQueueManager {
-    fn shutdown(&mut self) {
-        if self.running.swap(false, Ordering::AcqRel) {
-            if let Some(handle) = self.thread_handle.take() {
-                let _ = handle.join();
-            }
-        }
-
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.active_keys.clear();
-            guard.queues.clear();
-        }
+  fn shutdown(&mut self) {
+    if self.running.swap(false, Ordering::AcqRel) {
+      if let Some(handle) = self.thread_handle.take() {
+        let _ = handle.join();
+      }
     }
+
+    if let Ok(mut guard) = self.inner.lock() {
+      guard.active_keys.clear();
+      guard.queues.clear();
+    }
+  }
 }
 
 impl Drop for UdpQueueManager {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
+  fn drop(&mut self) {
+    self.shutdown();
+  }
 }
 
 #[napi]
 impl UdpQueueManager {
-    #[napi(constructor)]
-    pub fn new(buffer_duration_ms: Option<u32>) -> Result<Self> {
-        let default_buffer_duration_ms = buffer_duration_ms
-            .unwrap_or(DEFAULT_BUFFER_DURATION_MS)
-            .max(20);
+  #[napi(constructor)]
+  pub fn new(buffer_duration_ms: Option<u32>) -> Result<Self> {
+    let default_buffer_duration_ms = buffer_duration_ms
+      .unwrap_or(DEFAULT_BUFFER_DURATION_MS)
+      .max(20);
 
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-            .map_err(|e| napi::Error::from_reason(format!("Failed to create UDP socket: {e}")))?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+      .map_err(|e| napi::Error::from_reason(format!("Failed to create UDP socket: {e}")))?;
 
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| napi::Error::from_reason(format!("Failed to set non-blocking: {e}")))?;
+    socket
+      .set_nonblocking(true)
+      .map_err(|e| napi::Error::from_reason(format!("Failed to set non-blocking: {e}")))?;
 
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        socket
-            .bind(&SockAddr::from(bind_addr))
-            .map_err(|e| napi::Error::from_reason(format!("Failed to bind socket: {e}")))?;
+    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    socket
+      .bind(&SockAddr::from(bind_addr))
+      .map_err(|e| napi::Error::from_reason(format!("Failed to bind socket: {e}")))?;
 
-        let socket = Arc::new(socket);
+    let socket = Arc::new(socket);
 
-        let inner = Arc::new(Mutex::new(QueueManagerInner::new()));
-        let running = Arc::new(AtomicBool::new(true));
-        let packets_sent = Arc::new(AtomicU64::new(0));
-        let packets_dropped = Arc::new(AtomicU64::new(0));
+    let inner = Arc::new(Mutex::new(QueueManagerInner::new()));
+    let running = Arc::new(AtomicBool::new(true));
+    let packets_sent = Arc::new(AtomicU64::new(0));
+    let packets_dropped = Arc::new(AtomicU64::new(0));
 
-        let thread_inner = Arc::clone(&inner);
-        let thread_socket = Arc::clone(&socket);
-        let thread_running = Arc::clone(&running);
-        let thread_sent = Arc::clone(&packets_sent);
-        let thread_dropped = Arc::clone(&packets_dropped);
+    let thread_inner = Arc::clone(&inner);
+    let thread_socket = Arc::clone(&socket);
+    let thread_running = Arc::clone(&running);
+    let thread_sent = Arc::clone(&packets_sent);
+    let thread_dropped = Arc::clone(&packets_dropped);
 
-        let thread_handle = thread::Builder::new()
-            .name("udpqueue-sender".to_string())
-            .spawn(move || {
-                sender_thread(
-                    thread_inner,
-                    thread_socket,
-                    thread_running,
-                    thread_sent,
-                    thread_dropped,
-                );
-            })
-            .map_err(|e| napi::Error::from_reason(format!("Failed to spawn sender thread: {e}")))?;
+    let thread_handle = thread::Builder::new()
+      .name("udpqueue-sender".to_string())
+      .spawn(move || {
+        sender_thread(
+          thread_inner,
+          thread_socket,
+          thread_running,
+          thread_sent,
+          thread_dropped,
+        );
+      })
+      .map_err(|e| napi::Error::from_reason(format!("Failed to spawn sender thread: {e}")))?;
 
-        Ok(Self {
-            inner,
-            socket,
-            running,
-            packets_sent,
-            packets_dropped,
-            default_buffer_duration_ms,
-            thread_handle: Some(thread_handle),
-        })
+    Ok(Self {
+      inner,
+      socket,
+      running,
+      packets_sent,
+      packets_dropped,
+      default_buffer_duration_ms,
+      thread_handle: Some(thread_handle),
+    })
+  }
+
+  #[napi]
+  pub fn create_queue(
+    &self,
+    ip: String,
+    port: u32,
+    buffer_duration_ms: Option<u32>,
+  ) -> Result<u32> {
+    let addr: SocketAddr = format!("{ip}:{port}")
+      .parse()
+      .map_err(|e| napi::Error::from_reason(format!("Invalid address: {e}")))?;
+
+    if !addr.is_ipv4() {
+      return Err(napi::Error::from_reason(
+        "Only IPv4 is supported by this socket configuration",
+      ));
     }
 
-    #[napi]
-    pub fn create_queue(
-        &self,
-        ip: String,
-        port: u32,
-        buffer_duration_ms: Option<u32>,
-    ) -> Result<u32> {
-        let addr: SocketAddr = format!("{ip}:{port}")
-            .parse()
-            .map_err(|e| napi::Error::from_reason(format!("Invalid address: {e}")))?;
+    let capacity =
+      queue_capacity_from_ms(buffer_duration_ms.unwrap_or(self.default_buffer_duration_ms));
 
-        if !addr.is_ipv4() {
-            return Err(napi::Error::from_reason(
-                "Only IPv4 is supported by this socket configuration",
-            ));
-        }
+    let queue = QueueInner {
+      buffer: RingBuffer::new(capacity),
+      addr: SockAddr::from(addr),
+      active_index: None,
+    };
 
-        let capacity =
-            queue_capacity_from_ms(buffer_duration_ms.unwrap_or(self.default_buffer_duration_ms));
+    let mut guard = self.inner.lock().unwrap();
+    guard.insert_queue(queue)
+  }
 
-        let queue = QueueInner {
-            buffer: RingBuffer::new(capacity),
-            addr: SockAddr::from(addr),
-            active_index: None,
-        };
+  #[napi]
+  pub fn push_packet(&self, queue_key: u32, packet: BufferSlice<'_>) -> Result<bool> {
+    let mut guard = self.inner.lock().unwrap();
 
-        let mut guard = self.inner.lock().unwrap();
-        guard.insert_queue(queue)
+    let queue = guard
+      .get_queue_mut(queue_key)
+      .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
+
+    let was_empty = queue.buffer.is_empty();
+    let pushed = queue.buffer.push(packet.as_ref());
+
+    if pushed && was_empty {
+      guard.activate_queue(queue_key);
+    } else if !pushed {
+      self.packets_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[napi]
-    pub fn push_packet(&self, queue_key: u32, packet: BufferSlice<'_>) -> Result<bool> {
-        let mut guard = self.inner.lock().unwrap();
+    Ok(pushed)
+  }
 
-        let queue = guard
-            .get_queue_mut(queue_key)
-            .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
-
-        let was_empty = queue.buffer.is_empty();
-        let pushed = queue.buffer.push(packet.as_ref());
-
-        if pushed && was_empty {
-            guard.activate_queue(queue_key);
-        } else if !pushed {
-            self.packets_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-
-        Ok(pushed)
-    }
-
-    #[napi]
-    pub fn delete_queue(&self, queue_key: u32) -> Result<bool> {
-        let mut guard = self.inner.lock().unwrap();
-        Ok(guard.remove_queue(queue_key))
-    }
+  #[napi]
+  pub fn delete_queue(&self, queue_key: u32) -> Result<bool> {
+    let mut guard = self.inner.lock().unwrap();
+    Ok(guard.remove_queue(queue_key))
+  }
 }
