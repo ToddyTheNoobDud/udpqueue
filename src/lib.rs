@@ -16,6 +16,10 @@ fn queue_capacity_from_ms(buffer_duration_ms: u32) -> usize {
   ((buffer_duration_ms as usize) / 20).max(1)
 }
 
+// ---------------------------------------------------------------------------
+// Ring buffer
+// ---------------------------------------------------------------------------
+
 struct PacketSlot {
   data: [u8; MAX_PACKET_SIZE],
   len: usize,
@@ -87,7 +91,21 @@ impl RingBuffer {
   fn is_empty(&self) -> bool {
     self.count == 0
   }
+
+  fn len(&self) -> usize {
+    self.count
+  }
+
+  fn clear(&mut self) {
+    self.head = 0;
+    self.tail = 0;
+    self.count = 0;
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Queue internals
+// ---------------------------------------------------------------------------
 
 struct QueueInner {
   buffer: RingBuffer,
@@ -96,9 +114,9 @@ struct QueueInner {
 }
 
 struct QueueManagerInner {
-  // Key = index into this Vec. Deleted queues become None.
+  // key = index into this vec
   queues: Vec<Option<QueueInner>>,
-  // Only queues that currently have at least 1 packet buffered.
+  // only queues that currently have data
   active_keys: Vec<u32>,
 }
 
@@ -119,8 +137,8 @@ impl QueueManagerInner {
   }
 
   fn insert_queue(&mut self, queue: QueueInner) -> Result<u32> {
-    let key =
-      u32::try_from(self.queues.len()).map_err(|_| napi::Error::from_reason("Too many queues"))?;
+    let key = u32::try_from(self.queues.len())
+      .map_err(|_| napi::Error::from_reason("Too many queues"))?;
     self.queues.push(Some(queue));
     Ok(key)
   }
@@ -193,6 +211,10 @@ struct PendingPacket {
   addr: SockAddr,
 }
 
+// ---------------------------------------------------------------------------
+// Platform-specific timing
+// ---------------------------------------------------------------------------
+
 #[cfg(windows)]
 mod platform {
   use super::*;
@@ -241,7 +263,11 @@ mod platform {
     }
 
     let remaining = target.saturating_duration_since(Instant::now());
-    let coarse = remaining.saturating_sub(Duration::from_millis(2));
+    let coarse = remaining.saturating_sub(Duration::from_micros(1000));
+    // reduce this to 1ms or 500us, idk if it will reduce the CPU in windows tbh. ^~
+    //
+    // nvm, found out 1ms is the best balance in CPU/STABILITY/JITTER.
+    // 500 provides a low latency n stuff but costs too much cpu, same w 2ms.
 
     if !coarse.is_zero() {
       thread::sleep(coarse);
@@ -375,6 +401,10 @@ mod platform {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sender thread
+// ---------------------------------------------------------------------------
+
 fn sender_thread(
   inner: Arc<Mutex<QueueManagerInner>>,
   socket: Arc<Socket>,
@@ -390,6 +420,7 @@ fn sender_thread(
 
   let mut pending: Vec<PendingPacket> = Vec::with_capacity(PREALLOCATED_QUEUES);
   let mut send_bufs: Vec<[u8; MAX_PACKET_SIZE]> = Vec::with_capacity(PREALLOCATED_QUEUES);
+
   for _ in 0..PREALLOCATED_QUEUES {
     send_bufs.push([0u8; MAX_PACKET_SIZE]);
   }
@@ -400,7 +431,6 @@ fn sender_thread(
     next_tick += frame_duration;
     pending.clear();
 
-    // Phase 1: pop one packet from each active queue under the lock.
     {
       let mut guard = inner.lock().unwrap();
 
@@ -450,7 +480,6 @@ fn sender_thread(
       }
     }
 
-    // Phase 2: send outside the lock.
     for (i, pkt) in pending.iter().enumerate() {
       match socket.send_to(&send_bufs[i][..pkt.len], &pkt.addr) {
         Ok(_) => {
@@ -466,21 +495,36 @@ fn sender_thread(
     if next_tick > now {
       platform::precise_sleep_until(next_tick, &sleep_ctx);
     } else {
-      // We fell behind; resync instead of accumulating drift.
       next_tick = now;
     }
   }
 }
 
-/// Native UDP queue manager that sends packets from a dedicated thread
-/// on a fixed 20ms cadence, independent of JS event-loop jitter.
+// ---------------------------------------------------------------------------
+// NAPI objects
+// ---------------------------------------------------------------------------
+
+#[napi(object)]
+pub struct UdpQueueStats {
+  pub packets_sent: i64,
+  pub packets_dropped: i64,
+}
+
+#[napi(object)]
+pub struct QueueInfo {
+  pub queued_packets: u32,
+  pub capacity_packets: u32,
+}
+
+// ---------------------------------------------------------------------------
+// UdpQueueManager
+// ---------------------------------------------------------------------------
+
 #[napi]
 pub struct UdpQueueManager {
   inner: Arc<Mutex<QueueManagerInner>>,
-  #[allow(dead_code)]
   socket: Arc<Socket>,
   running: Arc<AtomicBool>,
-  #[allow(dead_code)]
   packets_sent: Arc<AtomicU64>,
   packets_dropped: Arc<AtomicU64>,
   default_buffer_duration_ms: u32,
@@ -619,5 +663,115 @@ impl UdpQueueManager {
   pub fn delete_queue(&self, queue_key: u32) -> Result<bool> {
     let mut guard = self.inner.lock().unwrap();
     Ok(guard.remove_queue(queue_key))
+  }
+
+  #[napi]
+  pub fn local_address(&self) -> Result<String> {
+    let addr = self
+      .socket
+      .local_addr()
+      .map_err(|e| napi::Error::from_reason(format!("Failed to get local address: {e}")))?;
+
+    let socket_addr = addr
+      .as_socket()
+      .ok_or_else(|| napi::Error::from_reason("Local socket address unavailable"))?;
+
+    Ok(socket_addr.to_string())
+  }
+
+  #[napi]
+  pub fn close(&mut self) {
+    self.shutdown();
+  }
+
+  #[napi]
+  pub fn clear_queue(&self, queue_key: u32) -> Result<bool> {
+    let mut guard = self.inner.lock().unwrap();
+
+    let active_index = {
+      let queue = guard
+        .get_queue_mut(queue_key)
+        .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
+
+      queue.buffer.clear();
+      queue.active_index
+    };
+
+    if let Some(pos) = active_index {
+      guard.deactivate_active_key_at(pos);
+    }
+
+    Ok(true)
+  }
+
+  #[napi]
+  pub fn stats(&self) -> UdpQueueStats {
+    UdpQueueStats {
+      packets_sent: self.packets_sent.load(Ordering::Relaxed) as i64,
+      packets_dropped: self.packets_dropped.load(Ordering::Relaxed) as i64,
+    }
+  }
+
+  #[napi]
+  pub fn queue_info(&self, queue_key: u32) -> Result<QueueInfo> {
+    let guard = self.inner.lock().unwrap();
+
+    let queue = guard
+      .get_queue(queue_key)
+      .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
+
+    Ok(QueueInfo {
+      queued_packets: queue.buffer.len() as u32,
+      capacity_packets: queue.buffer.capacity as u32,
+    })
+  }
+
+  #[napi]
+  pub fn update_queue_target(
+    &self,
+    queue_key: u32,
+    ip: String,
+    port: u32,
+  ) -> Result<bool> {
+    let addr: SocketAddr = format!("{ip}:{port}")
+      .parse()
+      .map_err(|e| napi::Error::from_reason(format!("Invalid address: {e}")))?;
+
+    if !addr.is_ipv4() {
+      return Err(napi::Error::from_reason(
+        "Only IPv4 is supported by this socket configuration",
+      ));
+    }
+
+    let mut guard = self.inner.lock().unwrap();
+
+    let queue = guard
+      .get_queue_mut(queue_key)
+      .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
+
+    queue.addr = SockAddr::from(addr);
+    Ok(true)
+  }
+
+  #[napi]
+  pub fn send_now(&self, queue_key: u32, packet: BufferSlice<'_>) -> Result<bool> {
+    let addr = {
+      let guard = self.inner.lock().unwrap();
+      let queue = guard
+        .get_queue(queue_key)
+        .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
+      queue.addr.clone()
+    };
+
+    match self.socket.send_to(packet.as_ref(), &addr) {
+      Ok(_) => {
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+      }
+      Err(_) => {
+        self.packets_dropped.fetch_add(1, Ordering::Relaxed);
+        Ok(false)
+      }
+    }
   }
 }
