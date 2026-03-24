@@ -1,6 +1,6 @@
 {
   "name": "@toddynnn/udpqueue",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "An udpqueue made to replace setTimeout in nodelink's voice code.",
   "main": "index.js",
   "repository": {

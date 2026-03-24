@@ -137,8 +137,8 @@ impl QueueManagerInner {
   }
 
   fn insert_queue(&mut self, queue: QueueInner) -> Result<u32> {
-    let key = u32::try_from(self.queues.len())
-      .map_err(|_| napi::Error::from_reason("Too many queues"))?;
+    let key =
+      u32::try_from(self.queues.len()).map_err(|_| napi::Error::from_reason("Too many queues"))?;
     self.queues.push(Some(queue));
     Ok(key)
   }
@@ -727,12 +727,7 @@ impl UdpQueueManager {
   }
 
   #[napi]
-  pub fn update_queue_target(
-    &self,
-    queue_key: u32,
-    ip: String,
-    port: u32,
-  ) -> Result<bool> {
+  pub fn update_queue_target(&self, queue_key: u32, ip: String, port: u32) -> Result<bool> {
     let addr: SocketAddr = format!("{ip}:{port}")
       .parse()
       .map_err(|e| napi::Error::from_reason(format!("Invalid address: {e}")))?;
