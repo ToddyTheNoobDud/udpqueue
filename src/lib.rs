@@ -1,7 +1,3 @@
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
-use chacha20poly1305::XChaCha20Poly1305;
-use chacha20poly1305::XNonce;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -16,133 +12,8 @@ const MAX_PACKET_SIZE: usize = 4096;
 const DEFAULT_BUFFER_DURATION_MS: u32 = 400;
 const PREALLOCATED_QUEUES: usize = 64;
 
-// Discord voice constants
-const RTP_HEADER_SIZE: usize = 12;
-
 fn queue_capacity_from_ms(buffer_duration_ms: u32) -> usize {
   ((buffer_duration_ms as usize) / 20).max(1)
-}
-
-// ---------------------------------------------------------------------------
-// Encryption
-// ---------------------------------------------------------------------------
-
-/// Discord voice encryption modes
-#[derive(Clone, Debug)]
-enum EncryptionMode {
-  Aes256Gcm,
-  XChaCha20Poly1305,
-}
-
-impl EncryptionMode {
-  fn from_str(s: &str) -> Option<Self> {
-    match s {
-      "aead_aes256_gcm_rtpsize" => Some(EncryptionMode::Aes256Gcm),
-      "aead_xchacha20_poly1305_rtpsize" => Some(EncryptionMode::XChaCha20Poly1305),
-      _ => None,
-    }
-  }
-}
-
-/// Per-queue voice encryption state.
-/// JS is the single source of truth for sequence/timestamp/nonce —
-/// those are passed per-frame via push_encrypted_frame.
-/// This struct only holds the static crypto material.
-struct VoiceCryptoState {
-  secret_key: [u8; 32],
-  ssrc: u32,
-  encryption_mode: EncryptionMode,
-}
-
-/// Build a 12-byte RTP header into `out[0..12]`.
-fn write_rtp_header(out: &mut [u8], sequence: u16, timestamp: u32, ssrc: u32) {
-  out[0] = 0x80; // version 2, no padding, no extension, 0 CSRC
-  out[1] = 0x78; // payload type 120 (Discord voice)
-  out[2..4].copy_from_slice(&sequence.to_be_bytes());
-  out[4..8].copy_from_slice(&timestamp.to_be_bytes());
-  out[8..12].copy_from_slice(&ssrc.to_be_bytes());
-}
-
-/// Encrypt `plaintext` using the given crypto state, RTP header as AAD,
-/// and the caller-supplied nonce/sequence/timestamp.
-/// Writes the fully-formed packet (RTP header || ciphertext+tag || nonce_trailer)
-/// into `out`. Returns the total packet length on success.
-fn encrypt_and_pack(
-  crypto: &VoiceCryptoState,
-  plaintext: &[u8],
-  sequence: u16,
-  timestamp: u32,
-  nonce_value: u32,
-  out: &mut [u8],
-) -> Result<usize> {
-  // Write RTP header
-  write_rtp_header(out, sequence, timestamp, crypto.ssrc);
-  let rtp_header = &out[0..RTP_HEADER_SIZE];
-
-  match &crypto.encryption_mode {
-    EncryptionMode::Aes256Gcm => {
-      // 12-byte nonce: 4 bytes of counter (big-endian) + 8 zero bytes
-      let mut nonce_bytes = [0u8; 12];
-      nonce_bytes[0..4].copy_from_slice(&nonce_value.to_be_bytes());
-      let nonce = Nonce::from_slice(&nonce_bytes);
-
-      let cipher = Aes256Gcm::new_from_slice(&crypto.secret_key)
-        .map_err(|e| napi::Error::from_reason(format!("AES key error: {e}")))?;
-
-      let ciphertext = cipher
-        .encrypt(
-          nonce,
-          Payload {
-            msg: plaintext,
-            aad: rtp_header,
-          },
-        )
-        .map_err(|e| napi::Error::from_reason(format!("AES-GCM encrypt failed: {e}")))?;
-
-      // Packet layout: RTP header (12) || ciphertext+tag || nonce trailer (4)
-      let total_len = RTP_HEADER_SIZE + ciphertext.len() + 4;
-      if total_len > out.len() {
-        return Err(napi::Error::from_reason("Packet too large for buffer"));
-      }
-
-      out[RTP_HEADER_SIZE..RTP_HEADER_SIZE + ciphertext.len()].copy_from_slice(&ciphertext);
-      out[RTP_HEADER_SIZE + ciphertext.len()..total_len]
-        .copy_from_slice(&nonce_value.to_be_bytes());
-
-      Ok(total_len)
-    }
-    EncryptionMode::XChaCha20Poly1305 => {
-      // 24-byte nonce: 4 bytes of counter (big-endian) + 20 zero bytes
-      let mut nonce_bytes = [0u8; 24];
-      nonce_bytes[0..4].copy_from_slice(&nonce_value.to_be_bytes());
-      let nonce = XNonce::from_slice(&nonce_bytes);
-
-      let cipher = XChaCha20Poly1305::new_from_slice(&crypto.secret_key)
-        .map_err(|e| napi::Error::from_reason(format!("XChaCha key error: {e}")))?;
-
-      let ciphertext = cipher
-        .encrypt(
-          nonce,
-          Payload {
-            msg: plaintext,
-            aad: rtp_header,
-          },
-        )
-        .map_err(|e| napi::Error::from_reason(format!("XChaCha20 encrypt failed: {e}")))?;
-
-      // Packet layout: RTP header (12) || ciphertext+tag || nonce trailer (4)
-      let total_len = RTP_HEADER_SIZE + ciphertext.len() + 4;
-      if total_len > out.len() {
-        return Err(napi::Error::from_reason("Packet too large for buffer"));
-      }
-
-      out[RTP_HEADER_SIZE..RTP_HEADER_SIZE + ciphertext.len()].copy_from_slice(&ciphertext);
-      out[RTP_HEADER_SIZE + ciphertext.len()..total_len]
-        .copy_from_slice(&nonce_value.to_be_bytes());
-
-      Ok(total_len)
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,13 +111,12 @@ struct QueueInner {
   buffer: RingBuffer,
   addr: SockAddr,
   active_index: Option<usize>,
-  /// When Some, this queue is a "voice queue" that accepts raw Opus frames
-  /// via push_encrypted_frame and handles RTP header + encryption natively.
-  voice_crypto: Option<VoiceCryptoState>,
 }
 
 struct QueueManagerInner {
+  // key = index into this vec
   queues: Vec<Option<QueueInner>>,
+  // only queues that currently have data
   active_keys: Vec<u32>,
 }
 
@@ -394,6 +264,10 @@ mod platform {
 
     let remaining = target.saturating_duration_since(Instant::now());
     let coarse = remaining.saturating_sub(Duration::from_micros(1000));
+    // reduce this to 1ms or 500us, idk if it will reduce the CPU in windows tbh. ^~
+    //
+    // nvm, found out 1ms is the best balance in CPU/STABILITY/JITTER.
+    // 500 provides a low latency n stuff but costs too much cpu, same w 2ms.
 
     if !coarse.is_zero() {
       thread::sleep(coarse);
@@ -735,8 +609,6 @@ impl UdpQueueManager {
     })
   }
 
-  /// Create a plain queue (backward compatible).
-  /// Accepts fully-formed packets via pushPacket.
   #[napi]
   pub fn create_queue(
     &self,
@@ -761,164 +633,12 @@ impl UdpQueueManager {
       buffer: RingBuffer::new(capacity),
       addr: SockAddr::from(addr),
       active_index: None,
-      voice_crypto: None,
     };
 
     let mut guard = self.inner.lock().unwrap();
     guard.insert_queue(queue)
   }
 
-  /// Create a voice queue that handles RTP header construction + encryption
-  /// natively. Use push_encrypted_frame to push raw Opus (or MLS-encrypted)
-  /// frames with caller-supplied sequence/timestamp/nonce.
-  ///
-  /// `encryption_mode` must be one of:
-  ///   - "aead_aes256_gcm_rtpsize"
-  ///   - "aead_xchacha20_poly1305_rtpsize"
-  ///
-  /// `secret_key` must be exactly 32 bytes.
-  #[napi]
-  pub fn create_voice_queue(
-    &self,
-    ip: String,
-    port: u32,
-    ssrc: u32,
-    encryption_mode: String,
-    secret_key: Buffer,
-    buffer_duration_ms: Option<u32>,
-  ) -> Result<u32> {
-    let addr: SocketAddr = format!("{ip}:{port}")
-      .parse()
-      .map_err(|e| napi::Error::from_reason(format!("Invalid address: {e}")))?;
-
-    if !addr.is_ipv4() {
-      return Err(napi::Error::from_reason(
-        "Only IPv4 is supported by this socket configuration",
-      ));
-    }
-
-    let enc_mode = EncryptionMode::from_str(&encryption_mode)
-            .ok_or_else(|| napi::Error::from_reason(format!(
-                "Unsupported encryption mode: '{encryption_mode}'. Use 'aead_aes256_gcm_rtpsize' or 'aead_xchacha20_poly1305_rtpsize'"
-            )))?;
-
-    if secret_key.len() != 32 {
-      return Err(napi::Error::from_reason(
-        "secret_key must be exactly 32 bytes",
-      ));
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&secret_key);
-
-    let capacity =
-      queue_capacity_from_ms(buffer_duration_ms.unwrap_or(self.default_buffer_duration_ms));
-
-    let voice_crypto = VoiceCryptoState {
-      secret_key: key,
-      ssrc,
-      encryption_mode: enc_mode,
-    };
-
-    let queue = QueueInner {
-      buffer: RingBuffer::new(capacity),
-      addr: SockAddr::from(addr),
-      active_index: None,
-      voice_crypto: Some(voice_crypto),
-    };
-
-    let mut guard = self.inner.lock().unwrap();
-    guard.insert_queue(queue)
-  }
-
-  /// Push a raw Opus (or MLS-encrypted) frame for native encryption + send.
-  ///
-  /// The caller (JS) owns sequence/timestamp/nonce — pass them explicitly
-  /// so JS remains the single source of truth for counter state.
-  ///
-  /// The Rust code will:
-  ///   1. Build the 12-byte RTP header with the given sequence/timestamp/ssrc
-  ///   2. Encrypt the frame with the given nonce and the queue's key
-  ///   3. Append the nonce trailer
-  ///   4. Enqueue the fully-formed packet in the ring buffer
-  ///
-  /// Returns true if the frame was queued, false if the buffer is full.
-  #[napi]
-  pub fn push_encrypted_frame(
-    &self,
-    queue_key: u32,
-    opus_frame: BufferSlice<'_>,
-    sequence: u16,
-    timestamp: u32,
-    nonce: u32,
-  ) -> Result<bool> {
-    let mut packet_buf = [0u8; MAX_PACKET_SIZE];
-
-    let mut guard = self.inner.lock().unwrap();
-
-    let queue = guard
-      .get_queue_mut(queue_key)
-      .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
-
-    let crypto = queue
-            .voice_crypto
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason(
-                "Queue does not have voice encryption state. Use createVoiceQueue() instead of createQueue()."
-            ))?;
-
-    let packet_len = encrypt_and_pack(
-      crypto,
-      opus_frame.as_ref(),
-      sequence,
-      timestamp,
-      nonce,
-      &mut packet_buf,
-    )?;
-
-    let was_empty = queue.buffer.is_empty();
-    let pushed = queue.buffer.push(&packet_buf[..packet_len]);
-
-    if pushed && was_empty {
-      guard.activate_queue(queue_key);
-    } else if !pushed {
-      self.packets_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    Ok(pushed)
-  }
-
-  /// Update the encryption secret key for a voice queue.
-  /// Discord rotates keys during session, so this must be callable
-  /// without recreating the queue.
-  #[napi]
-  pub fn set_encryption_key(&self, queue_key: u32, secret_key: Buffer) -> Result<bool> {
-    if secret_key.len() != 32 {
-      return Err(napi::Error::from_reason(
-        "secret_key must be exactly 32 bytes",
-      ));
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&secret_key);
-
-    let mut guard = self.inner.lock().unwrap();
-
-    let queue = guard
-      .get_queue_mut(queue_key)
-      .ok_or_else(|| napi::Error::from_reason("Queue not found"))?;
-
-    let crypto = queue
-      .voice_crypto
-      .as_mut()
-      .ok_or_else(|| napi::Error::from_reason("Queue does not have voice encryption state."))?;
-
-    crypto.secret_key = key;
-    Ok(true)
-  }
-
-  /// Push a fully-formed packet buffer (backward compatible).
-  /// Works with both plain queues and voice queues.
   #[napi]
   pub fn push_packet(&self, queue_key: u32, packet: BufferSlice<'_>) -> Result<bool> {
     let mut guard = self.inner.lock().unwrap();

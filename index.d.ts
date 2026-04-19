@@ -2,55 +2,7 @@
 /* eslint-disable */
 export declare class UdpQueueManager {
   constructor(bufferDurationMs?: number | undefined | null)
-  /**
-   * Create a plain queue (backward compatible).
-   * Accepts fully-formed packets via pushPacket.
-   */
   createQueue(ip: string, port: number, bufferDurationMs?: number | undefined | null): number
-  /**
-   * Create a voice queue that handles RTP header construction + encryption
-   * natively. Use push_encrypted_frame to push raw Opus (or MLS-encrypted)
-   * frames with caller-supplied sequence/timestamp/nonce.
-   *
-   * `encryption_mode` must be one of:
-   *   - "aead_aes256_gcm_rtpsize"
-   *   - "aead_xchacha20_poly1305_rtpsize"
-   *
-   * `secret_key` must be exactly 32 bytes.
-   */
-  createVoiceQueue(
-    ip: string,
-    port: number,
-    ssrc: number,
-    encryptionMode: string,
-    secretKey: Buffer,
-    bufferDurationMs?: number | undefined | null,
-  ): number
-  /**
-   * Push a raw Opus (or MLS-encrypted) frame for native encryption + send.
-   *
-   * The caller (JS) owns sequence/timestamp/nonce — pass them explicitly
-   * so JS remains the single source of truth for counter state.
-   *
-   * The Rust code will:
-   *   1. Build the 12-byte RTP header with the given sequence/timestamp/ssrc
-   *   2. Encrypt the frame with the given nonce and the queue's key
-   *   3. Append the nonce trailer
-   *   4. Enqueue the fully-formed packet in the ring buffer
-   *
-   * Returns true if the frame was queued, false if the buffer is full.
-   */
-  pushEncryptedFrame(queueKey: number, opusFrame: Buffer, sequence: number, timestamp: number, nonce: number): boolean
-  /**
-   * Update the encryption secret key for a voice queue.
-   * Discord rotates keys during session, so this must be callable
-   * without recreating the queue.
-   */
-  setEncryptionKey(queueKey: number, secretKey: Buffer): boolean
-  /**
-   * Push a fully-formed packet buffer (backward compatible).
-   * Works with both plain queues and voice queues.
-   */
   pushPacket(queueKey: number, packet: Buffer): boolean
   deleteQueue(queueKey: number): boolean
   localAddress(): string

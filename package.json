@@ -1,6 +1,6 @@
 {
   "name": "@toddynnn/udpqueue",
-  "version": "1.0.6",
+  "version": "1.0.4",
   "description": "An udpqueue made to replace setTimeout in nodelink's voice code.",
   "main": "index.js",
   "repository": {
@@ -64,21 +64,21 @@
     "prepare": "husky"
   },
   "devDependencies": {
-    "@emnapi/core": "^1.10.0",
-    "@emnapi/runtime": "^1.10.0",
-    "@napi-rs/cli": "^3.6.2",
-    "@oxc-node/core": "^0.1.0",
+    "@emnapi/core": "^1.5.0",
+    "@emnapi/runtime": "^1.5.0",
+    "@napi-rs/cli": "^3.2.0",
+    "@oxc-node/core": "^0.0.35",
     "@taplo/cli": "^0.7.0",
-    "@tybys/wasm-util": "^0.10.1",
+    "@tybys/wasm-util": "^0.10.0",
     "ava": "^7.0.0",
     "chalk": "^5.6.2",
     "husky": "^9.1.7",
-    "lint-staged": "^16.4.0",
+    "lint-staged": "^16.1.6",
     "npm-run-all2": "^8.0.4",
-    "oxlint": "^1.60.0",
-    "prettier": "^3.8.3",
+    "oxlint": "^1.14.0",
+    "prettier": "^3.6.2",
     "tinybench": "^6.0.0",
-    "typescript": "^6.0.3"
+    "typescript": "^5.9.2"
   },
   "lint-staged": {
     "*.@(js|ts|tsx)": [
