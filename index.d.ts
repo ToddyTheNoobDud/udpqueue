@@ -18,7 +18,14 @@ export declare class UdpQueueManager {
    *
    * `secret_key` must be exactly 32 bytes.
    */
-  createVoiceQueue(ip: string, port: number, ssrc: number, encryptionMode: string, secretKey: Buffer, bufferDurationMs?: number | undefined | null): number
+  createVoiceQueue(
+    ip: string,
+    port: number,
+    ssrc: number,
+    encryptionMode: string,
+    secretKey: Buffer,
+    bufferDurationMs?: number | undefined | null,
+  ): number
   /**
    * Push a raw Opus (or MLS-encrypted) frame for native encryption + send.
    *
