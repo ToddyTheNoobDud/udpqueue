@@ -2,16 +2,20 @@
 /* eslint-disable */
 export declare class UdpQueueManager {
   constructor(bufferDurationMs?: number | undefined | null)
-  createQueue(ip: string, port: number, bufferDurationMs?: number | undefined | null): number
+  createQueue(bufferDurationMs?: number | undefined | null): number
   pushPacket(queueKey: number, packet: Buffer): boolean
+  drainQueue(queueKey: number, nowNs: number): Buffer | null
+  drainAll(nowNs: number): Array<DrainItem>
+  resetPacing(queueKey: number): void
   deleteQueue(queueKey: number): boolean
-  localAddress(): string
-  close(): void
   clearQueue(queueKey: number): boolean
   stats(): UdpQueueStats
   queueInfo(queueKey: number): QueueInfo
-  updateQueueTarget(queueKey: number, ip: string, port: number): boolean
-  sendNow(queueKey: number, packet: Buffer): boolean
+}
+
+export interface DrainItem {
+  queueKey: number
+  data: Buffer
 }
 
 export interface QueueInfo {
@@ -20,6 +24,6 @@ export interface QueueInfo {
 }
 
 export interface UdpQueueStats {
-  packetsSent: number
+  packetsQueued: number
   packetsDropped: number
 }
