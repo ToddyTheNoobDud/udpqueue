@@ -11,7 +11,7 @@ test('UdpQueueManager can be created', (t) => {
 
 test('UdpQueueManager createQueue returns valid key', (t) => {
   const qm = new UdpQueueManager(400)
-  const key = qm.createQueue(400)  // only buffer_duration_ms
+  const key = qm.createQueue(400)
   t.is(typeof key, 'number')
   t.true(key >= 0)
   qm.deleteQueue(key)
@@ -19,7 +19,7 @@ test('UdpQueueManager createQueue returns valid key', (t) => {
 
 test('UdpQueueManager can push and delete queue', (t) => {
   const qm = new UdpQueueManager(400)
-  const key = qm.createQueue(400)  // only buffer_duration_ms
+  const key = qm.createQueue(400)
   const pushed = qm.pushPacket(key, new Uint8Array([1, 2, 3]))
   t.true(pushed)
   qm.deleteQueue(key)
@@ -40,8 +40,6 @@ test('UdpQueueManager drainQueue returns packet after push', (t) => {
 
   qm.pushPacket(key, data)
 
-  // First call might return null if pacing hasn't elapsed
-  // Reset pacing and drain
   qm.resetPacing(key)
   const packet = qm.drainQueue(key, Number(process.hrtime.bigint()))
 
@@ -50,7 +48,7 @@ test('UdpQueueManager drainQueue returns packet after push', (t) => {
   qm.deleteQueue(key)
 })
 
-test('UdpQueueManager drainAll returns packets', (t) => {
+test('UdpQueueManager drainAll returns packets one per call', (t) => {
   const qm = new UdpQueueManager(400)
   const key = qm.createQueue(400)
 
@@ -58,12 +56,19 @@ test('UdpQueueManager drainAll returns packets', (t) => {
   qm.pushPacket(key, new Uint8Array([2]))
 
   qm.resetPacing(key)
-  const items = qm.drainAll(Number(process.hrtime.bigint()))
+  const nowNs = Number(process.hrtime.bigint())
 
-  t.true(Array.isArray(items))
-  t.is(items.length, 2)
-  t.is(items[0].queue_key, key)
-  t.deepEqual(items[0].data, Buffer.from([1]))
+  // drainAll returns one per queue per call due to pacing
+  const items1 = qm.drainAll(nowNs)
+  t.is(items1.length, 1)
+  t.is(items1[0].queueKey, key)
+  t.deepEqual(items1[0].data, Buffer.from([1]))
+
+  // Second call gets the next packet (pacing elapsed)
+  const items2 = qm.drainAll(nowNs + 20_000_000) // +20ms in ns
+  t.is(items2.length, 1)
+  t.deepEqual(items2[0].data, Buffer.from([2]))
+
   qm.deleteQueue(key)
 })
 
@@ -77,8 +82,9 @@ test('UdpQueueManager stats tracks drops', (t) => {
   t.false(dropped)
 
   const stats = qm.stats()
-  t.is(stats.packets_queued, 1)
-  t.is(stats.packets_dropped, 1)
+  // napi-rs converts snake_case to camelCase
+  t.is(stats.packetsQueued, 1)
+  t.is(stats.packetsDropped, 1)
   qm.deleteQueue(key)
 })
 
@@ -87,12 +93,13 @@ test('UdpQueueManager queueInfo reports correctly', (t) => {
   const key = qm.createQueue(400)
 
   const info = qm.queueInfo(key)
-  t.is(info.queued_packets, 0)
-  t.is(info.capacity_packets, 20) // 400ms / 20ms = 20
+  // napi-rs converts snake_case to camelCase
+  t.is(info.queuedPackets, 0)
+  t.is(info.capacityPackets, 20) // 400ms / 20ms = 20
 
   qm.pushPacket(key, new Uint8Array([1]))
   const info2 = qm.queueInfo(key)
-  t.is(info2.queued_packets, 1)
+  t.is(info2.queuedPackets, 1)
 
   qm.deleteQueue(key)
 })
